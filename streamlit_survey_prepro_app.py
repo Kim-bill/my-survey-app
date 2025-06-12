@@ -1,19 +1,20 @@
-# streamlit_survey_prepro_app.py — v5 (simple pipeline)
+# streamlit_survey_prepro_app.py — v6 (adds codebook sheet)
 """
-Streamlit Survey Pre‑processing Toolkit  📊  — *Reset to simple pipeline*
-======================================================================
-* Upload Raw → select cleaning steps (Weight, Missing, Tidy, Label) → Run  → Download Excel (+ Tidy zip)
-* **No auto‑question text renaming**
-* **No manual label UI** — relies solely on existing `(TEXT)` columns for label encoding.
+Survey Pre‑processing Toolkit  📊 (Streamlit, minimal)
+----------------------------------------------------
+* Raw → (Weights) → Missing → (Label) → (Tidy) → Excel + optional ZIP
+* **Codebook**: second sheet named `codebook` lists `variable | code | label`.
+  - Built from any `<var>(TEXT)` pairs that exist in the uploaded file.
+  - For binary multi‑response columns we include a single row `code=1 label=Selected`.
+* No auto/manual renaming; relies on existing `(TEXT)` columns for value labels.
 """
-
 from __future__ import annotations
 import io, zipfile, re
 from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# ---------- Helper functions ----------
+# ---------- Helper ------------------
 
 def detect_pairs(cols):
     return {c[:-6]: c for c in cols if str(c).endswith('(TEXT)') and str(c)[:-6] in cols}
@@ -40,7 +41,7 @@ def handle_missing(df: pd.DataFrame, id_var: str):
     return df
 
 
-def add_weights(df: pd.DataFrame, pop_df: pd.DataFrame, strata: list[str], pop_col='pop_share'):
+def add_weights(df: pd.DataFrame, pop_df: pd.DataFrame, strata, pop_col='pop_share'):
     df['__key__'] = list(zip(*[df[c] for c in strata]))
     pop_df['__key__'] = list(zip(*[pop_df[c] for c in strata]))
     samp = df['__key__'].value_counts() / len(df)
@@ -52,7 +53,7 @@ def add_weights(df: pd.DataFrame, pop_df: pd.DataFrame, strata: list[str], pop_c
     return df.drop(columns=['__key__', 'sample_share', pop_col])
 
 
-def label_encode(df: pd.DataFrame, id_var: str):
+def label_encode(df: pd.DataFrame):
     pairs = detect_pairs(df.columns)
     mresp_flat = {c for cols in detect_multiresp(list(pairs.keys())).values() for c in cols}
     used = set(df.columns)
@@ -71,6 +72,23 @@ def label_encode(df: pd.DataFrame, id_var: str):
     return df
 
 
+def build_codebook(orig_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    pairs = detect_pairs(orig_df.columns)
+    for code_col, text_col in pairs.items():
+        subset = orig_df[[code_col, text_col]].dropna().drop_duplicates()
+        if subset.empty:
+            continue
+        for code, label in subset.values:
+            rows.append({'variable': code_col, 'code': code, 'label': label})
+    # Add binary MR columns without TEXT
+    mresp_flat = {c for cols in detect_multiresp(list(pairs.keys())).values() for c in cols}
+    for col in mresp_flat:
+        if col not in pairs:
+            rows.append({'variable': col, 'code': 1, 'label': 'Selected'})
+    return pd.DataFrame(rows)
+
+
 def tidy_zip(df: pd.DataFrame, id_var: str) -> bytes:
     pairs = detect_pairs(df.columns)
     buf = io.BytesIO()
@@ -79,70 +97,78 @@ def tidy_zip(df: pd.DataFrame, id_var: str) -> bytes:
             frames = []
             for code_col, text_col in pairs.items():
                 tid = df[[id_var, code_col, text_col]].dropna(subset=[code_col]).rename(
-                    columns={code_col:'code_value', text_col:'option_text'})
-                tid['option'] = code_col
-                frames.append(tid[[id_var,'option','code_value','option_text']])
+                    columns={code_col:'code_value', text_col:'label'})
+                tid['variable'] = code_col
+                frames.append(tid[[id_var,'variable','code_value','label']])
             zf.writestr('all_tidy.csv', pd.concat(frames).to_csv(index=False, encoding='utf-8-sig'))
     return buf.getvalue()
 
 # ---------- Streamlit UI ----------
 
 st.set_page_config(page_title="Survey Toolkit", page_icon="📊")
-st.title("📊 Survey Pre-processing Toolkit")
+st.title("📊 Survey Pre-processing Toolkit – v6")
 
-raw_file = st.sidebar.file_uploader("Raw survey file (Excel/CSV)", type=["xlsx","xls","csv"])
-id_var = st.sidebar.text_input("Respondent ID column", value="회원ID")
+raw = st.sidebar.file_uploader("Raw survey file", type=["xlsx", "xls", "csv"])
+id_var = st.sidebar.text_input("ID column", value="회원ID")
 
-# Weight options
+# weight options
 use_w = st.sidebar.checkbox("Enable weights")
 if use_w:
-    pop_file = st.sidebar.file_uploader("Population CSV", type=["csv","xlsx","xls"], key='pop')
+    pop_f = st.sidebar.file_uploader("Population CSV", type=["csv","xlsx","xls"], key='pop')
+    strata_cols = st.sidebar.text_input("Strata columns (comma-sep)")
     pop_col = st.sidebar.text_input("Population share column", value='pop_share')
-    strata_cols = st.sidebar.text_input("Strata columns (comma‑sep)")
 else:
-    pop_file = None
+    pop_f = None
 
-# Steps
+# processing toggles
 miss_ck = st.sidebar.checkbox("Missing-value handling", value=True)
-lab_ck  = st.sidebar.checkbox("Label encoding", value=False)
-tidy_ck = st.sidebar.checkbox("Tidy export")
-run = st.sidebar.button("🚀 Run")
+lab_ck  = st.sidebar.checkbox("Label encoding")
+tidy_ck = st.sidebar.checkbox("Tidy export (zip)")
+run     = st.sidebar.button("🚀 Run")
 
-if not run or raw_file is None:
-    st.info("📂 Upload Raw file and click *Run*.")
+if not run or raw is None:
+    st.info("Upload Raw file and click Run.")
     st.stop()
 
-# Load Raw
-suf = Path(raw_file.name).suffix.lower()
-df = pd.read_excel(raw_file, header=1) if suf in {'.xlsx','.xls'} else pd.read_csv(raw_file)
+# Load raw + keep a copy for codebook
+suf = Path(raw.name).suffix.lower()
+orig_df = pd.read_excel(raw, header=1) if suf in {'.xlsx', '.xls'} else pd.read_csv(raw)
+proc_df = orig_df.copy()
 
-# Weight
+# Weights
 if use_w:
-    if pop_file is None:
+    if pop_f is None:
         st.error("Population file missing"); st.stop()
     strata = [s.strip() for s in strata_cols.split(',') if s.strip()]
     if not strata:
-        st.error("Enter strata column names"); st.stop()
-    pop_df = pd.read_csv(pop_file) if Path(pop_file.name).suffix.lower()=='.csv' else pd.read_excel(pop_file)
-    df = add_weights(df, pop_df, strata, pop_col=pop_col)
-    st.success("Weight column added ✅")
+        st.error("Enter strata columns and rerun"); st.stop()
+    pop_df = pd.read_csv(pop_f) if Path(pop_f.name).suffix.lower()=='.csv' else pd.read_excel(pop_f)
+    proc_df = add_weights(proc_df, pop_df, strata, pop_col=pop_col)
+    st.success("Weights added ✅")
 
 # Missing
 if miss_ck:
-    df = handle_missing(df, id_var)
-    st.success("Missing-value handling done ✅")
+    proc_df = handle_missing(proc_df, id_var)
+    st.success("Missing handling done ✅")
 
 # Label
 if lab_ck:
-    df = label_encode(df, id_var)
+    proc_df = label_encode(proc_df)
     st.success("Label encoding done ✅")
 
-# Tidy
+# Codebook sheet
+codebook_df = build_codebook(orig_df)
+
+# Tidy zip
 if tidy_ck:
-    zbytes = tidy_zip(df, id_var)
+    zbytes = tidy_zip(orig_df, id_var)
     st.download_button("Download tidy zip", zbytes, file_name="tidy_outputs.zip", mime="application/zip")
 
-# Final download
+# Final Excel with codebook
 bio = io.BytesIO()
-df.to_excel(bio, index=False, engine='openpyxl')
-st.download_button("Download processed Excel", bio.getvalue(), file_name="processed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+with pd.ExcelWriter(bio, engine='openpyxl') as xl:
+    proc_df.to_excel(xl, index=False, sheet_name='data')
+    if not codebook_df.empty:
+        codebook_df.to_excel(xl, index=False, sheet_name='codebook')
+
+st.download_button("Download processed Excel (+ codebook)", bio.getvalue(), file_name="processed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
