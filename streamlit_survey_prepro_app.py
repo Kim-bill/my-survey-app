@@ -1,55 +1,39 @@
-# streamlit_survey_prepro_app.py
+# streamlit_survey_prepro_app.py — v3
 """
-Streamlit web‑app — Survey Pre‑processing Toolkit
-=================================================
-Upload a raw (or partially processed) survey file and choose which processing step(s)
-you want to run. The app wraps the modular scripts we built earlier and runs them
-in‑memory, returning a processed file for download.
+Streamlit web‑app — Survey Pre‑processing Toolkit  📊
+====================================================
+이번 버전은 **Raw 파일 1행의 질문 문장**을 자동으로 읽어
+변수 코드(Q1, Q2_1 …)를 질문 텍스트로 교체합니다.
 
-Main features
--------------
-1. **Missing‑value handling**  (binary encode multi‑response, fill NA=스킵)
-2. **Weight calculation**      (requires population CSV and strata columns)
-3. **Label encoding**          (code→label, MR column rename)
-4. **Tidy long export**        (per MR group + master) – as zip file
+* 다중응답(Q2_1, Q2_2 …)처럼 질문이 같은 열이 여러 개면
+  중복을 막기 위해 텍스트 뒤에 원래 코드명을 붙입니다.
+* 사용자는 사이드바 체크박스로 Auto‑label 기능을 켜거나 끌 수 있습니다.
 
-Prerequisites
--------------
-```bash
-pip install streamlit pandas openpyxl
-```
-Then run:
-```bash
-streamlit run streamlit_survey_prepro_app.py
-```
+기타 파이프라인(가중치, 미싱, tidy, 라벨링)은 이전 버전과 동일합니다.
 """
-
-import io
-import zipfile
+from __future__ import annotations
+import io, zipfile, re
 from pathlib import Path
-
 import pandas as pd
 import streamlit as st
 
-# ---------------- helper routines (taken from previous scripts) ---------------- #
+# ---------------- Helper Routines ---------------- #
 
 def detect_pairs(columns):
-    """Safely detect code/TEXT column pairs even when column names are not strings."""
+    """detect <code, code(TEXT)> column pairs"""
     pairs = {}
     for col in columns:
         col_str = str(col)
         if col_str.endswith('(TEXT)'):
             code_col = col_str[:-6]
-            # find matching original column object (string or otherwise)
             if code_col in columns or code_col in [str(c) for c in columns]:
                 pairs[code_col] = col
     return pairs
 
 def detect_multiresp(code_cols):
-    import re
-    groups = {}
+    groups: dict[str, list[str]] = {}
     for c in code_cols:
-        m = re.match(r'(.*?)_', c)
+        m = re.match(r'(.*?)_', str(c))
         if m:
             groups.setdefault(m.group(1), []).append(c)
     return {g: cols for g, cols in groups.items() if len(cols) >= 2}
@@ -58,14 +42,11 @@ def detect_multiresp(code_cols):
 
 def handle_missing(df: pd.DataFrame, id_var: str):
     pairs = detect_pairs(df.columns)
-    multiresp_cols = detect_multiresp(list(pairs.keys()))
-    multiresp_flat = {c for cols in multiresp_cols.values() for c in cols}
-    # binary encode
-    for col in multiresp_flat:
+    mresp_flat = {c for cols in detect_multiresp(list(pairs.keys())).values() for c in cols}
+    for col in mresp_flat:
         df[col] = df[col].notna().astype(int)
-    # conditional single response
     for col in df.columns:
-        if col in multiresp_flat or col == id_var:
+        if col in mresp_flat or col == id_var:
             continue
         if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_integer_dtype(df[col]):
             if df[col].nunique(dropna=True) <= 20:
@@ -85,35 +66,34 @@ def add_weights(df: pd.DataFrame, pop_df: pd.DataFrame, strata: list[str], pop_c
     df['weight'] = df[pop_col] / df['sample_share']
     return df.drop(columns=['__key__', 'sample_share', pop_col])
 
-# --- Label encode
+# --- Label encode (code→label, MR rename)
 
 def label_encode(df: pd.DataFrame, id_var: str):
     pairs = detect_pairs(df.columns)
-    mresp = detect_multiresp(list(pairs.keys()))
-    mresp_flat = {c for cols in mresp.values() for c in cols}
+    mresp_flat = {c for cols in detect_multiresp(list(pairs.keys())).values() for c in cols}
     used = set(df.columns)
     for code_col, text_col in pairs.items():
         if code_col in mresp_flat:
-            label = df[text_col].dropna().astype(str).unique()
-            label = label[0] if len(label) else code_col
-            base, i = label, 1
-            while label in used:
-                label = f"{base}_{i}"; i += 1
-            df.rename(columns={code_col: label}, inplace=True)
-            used.add(label)
+            lbl = df[text_col].dropna().astype(str).unique()
+            lbl = lbl[0] if len(lbl) else code_col
+            base, i = lbl, 1
+            while lbl in used:
+                lbl = f"{base}_{i}"; i += 1
+            df.rename(columns={code_col: lbl}, inplace=True)
+            used.add(lbl)
         else:
             df[code_col] = df[text_col]
         df.drop(columns=text_col, inplace=True)
     return df
 
-# --- Tidy export
+# --- Tidy export (zip)
 
 def tidy_zip(df: pd.DataFrame, id_var: str) -> bytes:
     pairs = detect_pairs(df.columns)
     mresp_groups = detect_multiresp(list(pairs.keys()))
-    all_frames = []
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        all_frames = []
         for code_col, text_col in pairs.items():
             tidy = (df[[id_var, code_col, text_col]].dropna(subset=[code_col])
                     .rename(columns={code_col:'code_value', text_col:'option_text'}))
@@ -121,9 +101,7 @@ def tidy_zip(df: pd.DataFrame, id_var: str) -> bytes:
             tidy = tidy[[id_var,'option','code_value','option_text']]
             all_frames.append(tidy)
         if all_frames:
-            all_df = pd.concat(all_frames)
-            csv_bytes = all_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
-            zf.writestr('all_tidy.csv', csv_bytes)
+            zf.writestr('all_tidy.csv', pd.concat(all_frames).to_csv(index=False, encoding='utf-8-sig'))
         for g, cols in mresp_groups.items():
             frames = []
             for c in cols:
@@ -132,68 +110,83 @@ def tidy_zip(df: pd.DataFrame, id_var: str) -> bytes:
                 t['option'] = c
                 frames.append(t[[id_var,'option','code_value','option_text']])
             if frames:
-                csv_bytes = pd.concat(frames).to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
-                zf.writestr(f'{g}_tidy.csv', csv_bytes)
-    return zip_buffer.getvalue()
+                zf.writestr(f'{g}_tidy.csv', pd.concat(frames).to_csv(index=False, encoding='utf-8-sig'))
+    return zip_buf.getvalue()
 
 # ---------------- Streamlit UI ---------------- #
 
+st.set_page_config(page_title="Survey Toolkit", page_icon="📊", layout="centered")
 st.title("📊 Survey Pre‑processing Toolkit")
 
-st.sidebar.header("1️⃣ Upload Files")
-raw_file = st.sidebar.file_uploader("Raw survey Excel/CSV", type=["xlsx","xls","csv"])
+# Upload raw
+raw_file = st.sidebar.file_uploader("1️⃣ Raw survey file (Excel/CSV)", type=["xlsx", "xls", "csv"])
+use_auto_label = st.sidebar.checkbox("Use question text as column label", value=True)
+
 id_var = st.sidebar.text_input("Respondent ID column", value="회원ID")
 
-st.sidebar.markdown("---")
-st.sidebar.header("2️⃣ Optional: Population CSV (for weights)")
-use_weight = st.sidebar.checkbox("Enable Weight Calculation")
+# Population (weight)
+use_weight = st.sidebar.checkbox("Enable weights")
 if use_weight:
-    pop_file = st.sidebar.file_uploader("Population CSV", type=["csv","xlsx","xls"], key="pop")
-    strata_cols = st.sidebar.text_input("Strata column names (comma‑sep)")
+    pop_file = st.sidebar.file_uploader("Population CSV", type=["csv", "xlsx", "xls"], key="pop")
     pop_col_name = st.sidebar.text_input("Population share column", value="pop_share")
 else:
     pop_file = None
 
-st.sidebar.markdown("---")
-st.sidebar.header("3️⃣ Select Steps")
-do_missing = st.sidebar.checkbox("Missing‑value handling", value=True)
-do_tidy   = st.sidebar.checkbox("Tidy(long) export")
-do_label  = st.sidebar.checkbox("Label encoding", value=True)
-run_btn = st.sidebar.button("🚀 Run Processing")
+# Steps
+step_missing = st.sidebar.checkbox("Missing-value handling", value=True)
+step_tidy = st.sidebar.checkbox("Tidy long export")
+step_label = st.sidebar.checkbox("Label encoding", value=True)
+run = st.sidebar.button("🚀 Run")
 
-# result placeholders
-if run_btn and raw_file is not None:
-    # read input
-    suf = Path(raw_file.name).suffix.lower()
-    if suf in {'.xlsx', '.xls'}:
-        df = pd.read_excel(raw_file, header=1)
-    else:
-        df = pd.read_csv(raw_file)
+if not run or raw_file is None:
+    st.info("📂 Upload Raw file and click ‘Run’.")
+    st.stop()
 
-    if use_weight:
-        if pop_file is None or not strata_cols:
-            st.error("Population file & strata must be provided for weights.")
-            st.stop()
-        pop_df = pd.read_csv(pop_file) if Path(pop_file.name).suffix.lower() == '.csv' else pd.read_excel(pop_file)
-        strata = [c.strip() for c in strata_cols.split(',') if c.strip()]
-        df = add_weights(df, pop_df, strata, pop_col=pop_col_name)
-        st.success("Weight column added ✅")
-
-    if do_missing:
-        df = handle_missing(df, id_var)
-        st.success("Missing‑value handling complete ✅")
-
-    if do_tidy:
-        zip_bytes = tidy_zip(df, id_var)
-        st.download_button("Download tidy CSVs (zip)", data=zip_bytes, file_name="tidy_outputs.zip", mime="application/zip")
-
-    if do_label:
-        df = label_encode(df, id_var)
-        st.success("Label encoding complete ✅")
-
-    # Prepare final download
-    towrite = io.BytesIO()
-    df.to_excel(towrite, index=False, engine='openpyxl')
-    st.download_button("Download processed file (Excel)", data=towrite.getvalue(), file_name="processed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+# -------- Read raw ----------
+raw_suffix = Path(raw_file.name).suffix.lower()
+if raw_suffix in {'.xlsx', '.xls'}:
+    df = pd.read_excel(raw_file, header=1)
+    if use_auto_label:
+        # read first two rows separately for mapping
+        raw_top = pd.read_excel(raw_file, header=None, nrows=2)
 else:
-    st.info("📂 먼저 Raw 파일을 업로드하고, 왼쪽 사이드바에서 처리 단계를 선택한 뒤 ‘Run Processing’ 버튼을 눌러 주세요.")
+    df = pd.read_csv(raw_file)
+    if use_auto_label:
+        raw_top = pd.read_csv(raw_file, header=None, nrows=2)
+
+# --- Auto label mapping ---
+if use_auto_label:
+    question_row = raw_top.iloc[0]
+    code_row = raw_top.iloc[1]
+    mapping: dict[str,str] = {}
+    for q_text, code in zip(question_row, code_row):
+        if pd.notna(code):
+            mapping[str(code)] = str(q_text)
+    rename_map, used = {}, set()
+    for col in df.columns:
+        new_lbl = mapping.get(str(col), str(col))
+        if new_lbl in used:
+            new_lbl = f"{new_lbl} ({col})"  # avoid duplicates
+        rename_map[col] = new_lbl
+        used.add(new_lbl)
+    df.rename(columns=rename_map, inplace=True)
+    st.success(f"Auto‑labeled {len(rename_map)} columns using question text ✅")
+
+# -------- Weight --------
+if use_weight:
+    if pop_file is None:
+        st.error("Population CSV missing."); st.stop()
+    pop_df = pd.read_csv(pop_file) if Path(pop_file.name).suffix.lower()=='.csv' else pd.read_excel(pop_file)
+    strata = st.multiselect("Pick strata columns", options=df.columns.tolist(), default=[])
+    if not strata: st.error("Select strata columns"); st.stop()
+    df = add_weights(df, pop_df, strata, pop_col=pop_col_name)
+    st.success("Weight column added ✅")
+
+# -------- Missing --------
+if step_missing:
+    df = handle_missing(df, id_var)
+    st.success("Missing-value handling done ✅")
+
+# -------- Tidy --------
+if step_tidy:
+    zip_bytes = tidy
