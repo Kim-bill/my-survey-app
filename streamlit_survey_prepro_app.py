@@ -34,7 +34,16 @@ import streamlit as st
 # ---------------- helper routines (taken from previous scripts) ---------------- #
 
 def detect_pairs(columns):
-    return {col[:-6]: col for col in columns if col.endswith('(TEXT)') and col[:-6] in columns}
+    """Safely detect code/TEXT column pairs even when column names are not strings."""
+    pairs = {}
+    for col in columns:
+        col_str = str(col)
+        if col_str.endswith('(TEXT)'):
+            code_col = col_str[:-6]
+            # find matching original column object (string or otherwise)
+            if code_col in columns or code_col in [str(c) for c in columns]:
+                pairs[code_col] = col
+    return pairs
 
 def detect_multiresp(code_cols):
     import re
